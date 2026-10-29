@@ -1,2 +1,85 @@
-# open-balcony-studio
-Local-first PDF and image intake for parametric facade and balcony models, drawings, IFC and renders. Synthetic examples only.
+# OPENARCH
+
+A local application for turning architectural PDFs and photographs into a reviewed specification, a FreeCAD model, drawing sheets, an IFC exchange model, Blender visuals and a balcony register.
+
+**Early functional prototype.** The aim is to automate most first-draft work; a 90-95% completion or accuracy claim has **not** been established. Current scope is one rectangular building envelope and its front facade. Complex courtyards, multiple wings, irregular roofs, interior layouts and construction detailing are outside this version.
+
+## Run locally
+
+Python 3.11+ is required. FreeCAD and Blender are separate applications, not bundled or downloaded automatically.
+
+```bash
+python -m venv .venv
+# Activate .venv using your shell, then:
+python -m pip install -e '.[dev]'
+python -m openarch
+```
+
+Open **http://127.0.0.1:8765**. Start with **Try a synthetic example**. It creates fictional dimensioned PDFs locally; no customer drawings are shipped in this repository.
+
+Set executable paths before starting the app:
+
+```powershell
+$env:FREECAD_CMD = 'C:\path\to\FreeCADCmd.exe'
+$env:BLENDER_EXE = 'C:\path\to\blender.exe'
+$env:OPENARCH_DATA_DIR = 'C:\private\balcony-projects'
+python -m openarch
+```
+
+The default data directory is `%LOCALAPPDATA%/OPENARCH` on Windows, or `~/.local/share/OPENARCH` elsewhere. It **must be outside the code checkout**. Use a short data-directory path on Windows because native CAD libraries may impose path-length limits.
+
+The integration was exercised with FreeCAD 1.1.4 (including IfcOpenShell 0.8.4) and Blender 5.2.2. The API and core tests do not need either application. The command-line worker needs FreeCAD's Part and TechDraw modules and IfcOpenShell. Blender is optional: without it, CAD, IFC, drawings and the register still export.
+
+## Workflow
+
+1. Create a project and upload PDFs, PNGs, JPGs or WEBP images. Local analysis starts automatically.
+2. The app renders pages, extracts PDF text, optionally runs Tesseract OCR, and identifies explicit named dimensions and rectilinear vector facade openings.
+3. Missing/conflicting values stop model generation. Known but unreviewed values can generate a clearly labelled draft.
+4. Inspect source pages, calibrate a known distance, review dimensions, edit floor levels and adjust balcony proposals. Advanced JSON editing covers opening positions and other specification fields.
+5. Generate a revisioned package. It includes FCStd, IFC4, SVG views, PDF drawing sheets, CSV/JSON register, source-evidence report and checksums. With Blender configured it also includes PNG, BLEND and GLB.
+
+The app's saved specification is authoritative. Direct FreeCAD/Blender edits are not imported back into the app; a new generated revision will use the saved specification. Prior runs remain separate. IFC is a tessellated exchange copy, not a round-trip replacement for native parametric objects.
+
+### What local extraction can do
+
+It recognizes explicit labels such as `Facade width: 12000 mm`, `Building depth: 8000 mm`, `Eaves height: 10000 mm`, `Wall thickness: 400 mm` and `Level L1: 3200 mm`, with selected Danish equivalents. It proposes rectangular openings when a vector elevation contains an unambiguous facade rectangle matching the extracted aspect ratio. These are candidates, not verified measurements.
+
+Arbitrary old scans do not follow this controlled pattern. For them, configure `TESSERACT_CMD` for local OCR, use calibration/manual review, or explicitly opt into cloud vision. Page calibration provides a pixel-to-mm measurement aid and is passed to the cloud adapter; it does not automatically trace an entire plan or rectify oblique photographs. A printed scale on a mixed-scale sheet is not blindly applied to every drawing.
+
+### Optional cloud interpretation
+
+```powershell
+$env:OPENAI_API_KEY = '<set privately in your terminal>'
+$env:OPENAI_MODEL = '<your chosen vision-capable Responses API model>'
+```
+
+Prepare pages locally, select 1-8 pages and tick the consent box **for that job**. Only then will their rendered previews, extracted text and calibration information be transmitted to the OpenAI Responses API. The adapter requests structured output with `store: false`. This does not constitute a promise about provider-wide retention; consult the provider's data controls. No remote model is contacted during local mode, and no API key is bundled.
+
+The adapter is covered by mocked contract/consent tests. Live cloud extraction has not been benchmarked in this release. Read the official [image-input guide](https://developers.openai.com/api/docs/guides/images-vision?api-mode=responses) and [structured-output guide](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses).
+
+## Client confidentiality
+
+- Public code and private project storage are separate. No client plans, Revit models/families, extracted dimensions, IDs, addresses, renders or registers are included in the repository.
+- Synthetic fixtures are generated by source code, from invented values.
+- Original files, previews, OCR text, jobs and logs remain in the private data directory. Package downloads contain generated outputs, not uploaded originals; generated outputs are still private client data.
+- The server binds to loopback only. There is no telemetry, CDN script, remote font, public deployment or GitHub upload feature in the application.
+- Mutations require a local session token and same-origin requests. File types, sizes, page counts, geometry bounds and download paths are checked.
+- `scripts/check_public_tree.py` scans tracked files before publication. `.gitignore` excludes common source/project artifacts. Neither is a substitute for reviewing changes before publishing.
+- Do not expose this development server to a LAN or the internet. It has no multi-user authentication, encrypted-at-rest storage or tenant isolation.
+
+## Validation and limitations
+
+The test suite covers synthetic PDF interpretation, stable proposal IDs, conflicting dimensions, geometry conflicts, calibration, private storage, traversal rejection, upload validation, stale revisions and cloud consent. Native CAD/Blender integration is tested separately when those applications are installed.
+
+`reviewed_measurements / measurement_count` is an **evidence-review count**, never a geometric accuracy percentage. IFC schema validation is not structural or regulatory validation. Baluster profiles, cornices, roof form and attachments are simplified for draft sales models. Picket counts are chosen at generation time; rerun the app after dimension changes to recalculate them.
+
+```bash
+pytest -q
+python scripts/check_public_tree.py
+```
+
+See [the architecture and acceptance plan](docs/architecture.md) for the path toward a measured 90-95% workflow target.
+
+## License
+
+MIT for this application's original code. FreeCAD, Blender, PDFium and other dependencies retain their own licenses. This repository does not confer rights to any uploaded drawings or imagery.

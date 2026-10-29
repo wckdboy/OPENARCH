@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openarch"
+version = "0.1.0"
+description = "Local-first evidence-to-model workflow for facades and balconies"
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "python-multipart>=0.0.20,<1", "pydantic>=2.10,<3", "pypdfium2>=4.30,<6", "pdfplumber>=0.11,<1", "Pillow>=11,<14", "reportlab>=4,<6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "httpx>=0.27,<1"]
+
+[project.scripts]
+openarch = "openarch.__main__:main"
+
+[tool.setuptools.package-data]
+openarch = ["static/*", "workers/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
