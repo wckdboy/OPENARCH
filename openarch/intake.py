@@ -1,4 +1,5 @@
 from pathlib import Path
+from contextlib import nullcontext
 import hashlib, uuid, re, os, subprocess, shutil
 from PIL import Image, ImageOps
 import pdfplumber
@@ -20,7 +21,7 @@ def kind(text):
 def ocr(path):
     exe=os.environ.get("TESSERACT_CMD") or shutil.which("tesseract")
     if not exe:return "", "No local OCR engine configured"
-    result=subprocess.run([exe,str(path),"stdout","--psm","11"],capture_output=True,text=True,timeout=60,encoding="utf-8",errors="replace")
+    result=subprocess.run([exe,str(path),"stdout","--psm","11"],capture_output=True,text=True,timeout=60,encoding="utf-8",errors="replace",creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     return (result.stdout[:100000],None) if result.returncode==0 else ("","Local OCR failed")
 
 def ingest(pid):
@@ -32,8 +33,8 @@ def ingest(pid):
         if len(pages)>=MAX_PAGES:raise ValueError("Limit: 100 pages per project")
         path=root/"sources"/src["stored_name"]
         if path.suffix==".pdf":
-            with pdfplumber.open(path) as textdoc, pdfium.PdfDocument(path) as renderdoc:
-                if len(renderdoc)+len(pages)>MAX_PAGES:raise ValueError("Limit: 100 pages per project")
+            with pdfplumber.open(path) as textdoc, (nullcontext(None) if poppler else pdfium.PdfDocument(path)) as renderdoc:
+                if len(textdoc.pages)+len(pages)>MAX_PAGES:raise ValueError("Limit: 100 pages per project")
                 for i,page in enumerate(textdoc.pages):
                     ident=f"{src['id']}-{i+1}"
                     target=root/"pages"/(ident+".png")

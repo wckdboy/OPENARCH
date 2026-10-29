@@ -33,13 +33,13 @@ The integration was exercised with FreeCAD 1.1.4 (including IfcOpenShell 0.8.4) 
 ## Workflow
 
 1. Create a project and upload PDFs, PNGs, JPGs or WEBP images (100 MB per file, 300 MB and 100 pages per project). Local analysis starts automatically. Identical files are stored once, with alternate filenames recorded as aliases. Saved HTML download pages are not drawings and are not accepted.
-2. The app renders pages, extracts PDF text, optionally runs Tesseract OCR, and identifies explicit named dimensions and rectilinear vector facade openings.
+2. The app renders pages, extracts PDF text, optionally runs Tesseract OCR, and identifies explicit named dimensions and rectilinear vector facade openings. Re-analysis of an existing model saves a separate extraction proposal; it preserves your current model and manual edits.
 3. Missing/conflicting values stop model generation. Known but unreviewed values can generate a clearly labelled draft.
 4. Inspect source pages and calibrate a known distance. In **Footprint**, trace the outer boundary and enclosed courtyards. Unscaled traces can be saved but cannot generate a metric model. Apply calibration only to an orthographic drawing; oblique photos need rectification.
 5. Review dimensions and floor levels, choose a facade edge for each opening/balcony, and edit positions in the tables. Facade offsets run from the displayed edge origin in its local direction. Advanced JSON remains available.
 6. Generate a revisioned package. It includes FCStd, IFC4, SVG views, PDF drawing sheets, CSV/JSON register, source-evidence report and checksums. With Blender configured it also includes PNG, BLEND and GLB.
 
-The app's saved specification is authoritative. Direct FreeCAD/Blender edits are not imported back into the app; a new generated revision will use the saved specification. Prior runs remain separate. IFC is a tessellated exchange copy, not a round-trip replacement for native parametric objects.
+The app's saved specification is authoritative. Direct FreeCAD/Blender edits are not imported back into the app; a new generated revision will use the saved specification. Prior runs remain separate. Generated TechDraw pages have automatic updating disabled to avoid expensive recomputation when opening a model; update the page explicitly after native geometry edits. IFC is a tessellated exchange copy, not a round-trip replacement for native parametric objects.
 
 ### What local extraction can do
 
@@ -78,10 +78,15 @@ The test suite covers synthetic PDF interpretation, stable proposal IDs, conflic
 
 ```bash
 pytest -q
+node --test tests/test_ui_state.js
 python scripts/check_public_tree.py
 ```
 
 See [the architecture and acceptance plan](docs/architecture.md) for the path toward a measured 90-95% workflow target.
+
+Read the [reliability audit and development specification](docs/reliability-audit.md) for fixed defects, remaining reconstruction gaps, the source strategy for Skråfoto and Google Earth, and the proposed acceptance gates. Image-coordinate footprints now require an explicit orthographic declaration before generation; older saved traces may need this confirmation. Changing a calibrated source invalidates the corresponding metric trace until calibration is reapplied.
+
+Native regression checks are opt-in: set `OPENARCH_TEST_NATIVE=1`, `FREECAD_CMD`, and optionally `OPENARCH_NATIVE_PROFILE` to a short private path, then run `pytest -q tests/test_native.py`. They exercise real FreeCAD solids, basement coverage, courtyard topology, drawing views and IFC schema validation using invented geometry. The ordinary CI runner does not include FreeCAD.
 
 ## License
 

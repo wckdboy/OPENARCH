@@ -10,19 +10,21 @@ LABELS={"width":r"(?:facade width|building width|facadebredde|bygningsbredde)",
         "wall_thickness":r"(?:wall thickness|vægtykkelse|murtykkelse)"}
 
 def unit_value(value,unit):
-    v=float(value.replace(",","."));return v*1000 if unit.lower()=="m" else v
+    v=float(value.replace(",","."));return v*{'mm':1,'cm':10,'m':1000}[unit.lower()]
 
 def local_extract(pages):
     spec=ModelSpec();candidates={k:[] for k in LABELS};levels={}
     for p in pages:
         text=p["text"]
         for key,label in LABELS.items():
-            for match in re.finditer(label+r"\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(mm|m)\b",text,re.I):
+            for match in re.finditer(label+r"\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b",text,re.I):
                 candidates[key].append((unit_value(*match.groups()),p["id"]))
-        for match in re.finditer(r"(?:level|floor|etage)\s*([A-Za-z0-9_-]+)\s*[:=]\s*\+?(\d+(?:[.,]\d+)?)\s*(mm|m)\b",text,re.I):
+        for match in re.finditer(r"(?:level|floor|etage)\s*([A-Za-z0-9_-]+)\s*[:=]\s*([+-]?\d+(?:[.,]\d+)?)\s*(mm|cm|m)\b",text,re.I):
             ident,value,unit=match.groups();v=unit_value(value,unit)
-            if ident in levels and abs(levels[ident][0]-v)>2:
-                spec.notes.append("Conflicting elevations for level "+ident);levels[ident]=(None,p["id"])
+            if ident in levels and (levels[ident][0] is None or abs(levels[ident][0]-v)>2):
+                note="Conflicting elevations for level "+ident
+                if note not in spec.notes:spec.notes.append(note)
+                levels[ident]=(None,p["id"])
             elif ident not in levels:levels[ident]=(v,p["id"])
     for key,values in candidates.items():
         distinct={round(v,2) for v,_ in values}
@@ -89,6 +91,8 @@ def cloud_extract(pages,root:Path,consent:bool,transport=None):
     if spec.footprint:
         spec.footprint.reviewed=False;spec.footprint.mm_per_unit.reviewed=False
         if spec.footprint.source_page not in ids:spec.footprint.source_page=None;spec.footprint.confidence=0
+        scale=spec.footprint.mm_per_unit
+        if scale.source_page not in ids:scale.source_page=None;scale.method='inferred';scale.confidence=min(scale.confidence,.3)
     for key in LABELS:
         m=getattr(spec,key);m.reviewed=False
         if m.source_page not in ids:m.source_page=None;m.method='inferred';m.confidence=min(m.confidence,.3)

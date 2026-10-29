@@ -33,31 +33,38 @@ def feature(name,shape,mat,cls):
     o=d.addObject('Part::Feature',name);o.Shape=shape;tag(o,mat,cls);visible.append(o);return o
 
 W=s['width']['value_mm'];D=s['depth']['value_mm'];H=s['eaves']['value_mm'];T=s['wall_thickness']['value_mm'];R=s['roof_rise']['value_mm']
+ZMIN=min([0]+[l['elevation']['value_mm'] for l in s['levels']])
 footprint=job.get('footprint_geometry');frames=job.get('facades') or {'front':{'origin':[0,0],'tangent':[1,0],'angle_deg':0}}
 if footprint:R=0
 params=d.addObject('App::FeaturePython','BuildingDimensions')
 for k,value in [('Width',W),('Depth',D),('Eaves',H),('Wall',T),('RoofRise',R)]:params.addProperty('App::PropertyLength',k,'Dimensions');setattr(params,k,value)
 if footprint:
     def ring_face(points):
+        # OCC coplanar Booleans need consistent face normals; a clockwise hole
+        # is still cut using an upward-facing tool face.
+        if sum(a[0]*b[1]-b[0]*a[1] for a,b in zip(points,points[1:]+points[:1]))<0:points=list(reversed(points))
         verts=[V(x,y,0) for x,y in points];return Part.Face(Part.makePolygon(verts+[verts[0]]))
     footprint_face=ring_face(footprint['rings'][0])
     for ring in footprint['rings'][1:]:footprint_face=footprint_face.cut(ring_face(ring))
-    volume=footprint_face.extrude(V(0,0,H));strips=[]
+    footprint_face=footprint_face.removeSplitter()
+    assert len(footprint_face.Faces)==1 and len(footprint_face.Wires)==len(footprint['rings']),'Disconnected or incorrect footprint topology'
+    volume=footprint_face.extrude(V(0,0,H-ZMIN));volume.translate(V(0,0,ZMIN));strips=[]
     for frame in frames.values():
         ox,oy=frame['origin'];tx,ty=frame['tangent'];length=frame['length_mm']
         points=[(ox+tx*x-ty*y,oy+ty*x+tx*y) for x,y in [(-T,0),(length+T,0),(length+T,T),(-T,T)]]
-        strips.append(ring_face(points).extrude(V(0,0,H)))
+        strip=ring_face(points).extrude(V(0,0,H-ZMIN));strip.translate(V(0,0,ZMIN));strips.append(strip)
     shape=strips[0].multiFuse(strips[1:]).common(volume).removeSplitter()
     interior_slab=footprint_face.extrude(V(0,0,180)).cut(shape).removeSplitter()
     shell=d.addObject('Part::Feature','PolygonWallShell');shell.Shape=shape
 else:
-    outer=box('Outer','BuildingDimensions.Width','BuildingDimensions.Depth','BuildingDimensions.Eaves',0,0,0,show=False)
-    inner=box('Inner','BuildingDimensions.Width-2*BuildingDimensions.Wall','BuildingDimensions.Depth-2*BuildingDimensions.Wall','BuildingDimensions.Eaves+10 mm','BuildingDimensions.Wall','BuildingDimensions.Wall',-5,show=False)
+    outer=box('Outer','BuildingDimensions.Width','BuildingDimensions.Depth',f'BuildingDimensions.Eaves-({ZMIN} mm)',0,0,ZMIN,show=False)
+    inner=box('Inner','BuildingDimensions.Width-2*BuildingDimensions.Wall','BuildingDimensions.Depth-2*BuildingDimensions.Wall',f'BuildingDimensions.Eaves-({ZMIN} mm)+10 mm','BuildingDimensions.Wall','BuildingDimensions.Wall',ZMIN-5,show=False)
     shell=d.addObject('Part::Cut','WallShell');shell.Base=outer;shell.Tool=inner;outer.Visibility=False;inner.Visibility=False
+opening_tools=[]
 for i,o in enumerate(s['openings']):
     frame=frames[o.get('facade_id','front')]
     cut=box('OpeningTool'+str(i),o['width_mm'],T+20,o['height_mm'],o['x_mm'],-10,o['z_mm'],show=False,frame=frame)
-    result=d.addObject('Part::Cut','WallCut'+str(i));result.Base=shell;result.Tool=cut;shell.Visibility=False;cut.Visibility=False;shell=result
+    opening_tools.append(cut)
     # Inset glazing and simple opening trims are presentation details, not joinery.
     x,z,w,h=o['x_mm'],o['z_mm'],o['width_mm'],o['height_mm']
     box('Glass'+str(i),w-80,12,h-80,x+40,T*.55,z+40,'glass',frame=frame)
@@ -66,6 +73,12 @@ for i,o in enumerate(s['openings']):
     box('Sill'+str(i),w-80,70,40,x+40,T*.5,z,'trim',frame=frame)
     box('Mullion'+str(i),35,70,h-80,x+w/2-17.5,T*.5,z+40,'trim',frame=frame)
     box('Lintel'+str(i),w+160,65,90,x-80,-65,z+h,'trim',frame=frame)
+if opening_tools:
+    toolset=d.addObject('Part::Compound','OpeningTools');toolset.Links=opening_tools
+    result=d.addObject('Part::Cut','WallOpenings');result.Base=shell;result.Tool=toolset
+    shell.Visibility=False;toolset.Visibility=False
+    for tool in opening_tools:tool.Visibility=False
+    shell=result
 tag(shell,'wall','IfcWall');shell.Visibility=True;visible.append(shell)
 levels={l['id']:l['elevation']['value_mm'] for l in s['levels']}
 for i,z in enumerate(levels.values()):
@@ -125,7 +138,13 @@ for o in visible:
     shape=o.Shape.copy();shape.Placement=o.getGlobalPlacement();world_shapes.append(shape)
 compound=Part.makeCompound(world_shapes)
 world_source=d.addObject('Part::Feature','WorldDrawingGeometry');world_source.Shape=compound;world_source.Visibility=False
-plan_shape=compound.common(Part.makeBox(W+20000,D+20000,1500,V(-10000,-10000,plan_z-250)))
+clip=Part.makeBox(W+20000,D+20000,1500,V(-10000,-10000,plan_z-250))
+plan_parts=[]
+for shape in world_shapes:
+    if shape.BoundBox.intersect(clip.BoundBox):
+        part=shape.common(clip)
+        if not part.isNull():plan_parts.append(part)
+plan_shape=Part.makeCompound(plan_parts)
 plan_source=d.addObject('Part::Feature','PlanCutGeometry');plan_source.Shape=plan_shape;plan_source.Visibility=False
 template=O/'sheet-template.svg';template.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="420mm" height="297mm" viewBox="0 0 420 297"><text x="12" y="15" font-size="5">OPENARCH / DRAFT</text></svg>')
 page=d.addObject('TechDraw::DrawPage','Drawings');tpl=d.addObject('TechDraw::DrawSVGTemplate','Template');tpl.Template=str(template);page.Template=tpl
@@ -147,8 +166,9 @@ for v in [front,plan,section]:
     raw=raw.replace('stroke-width="0.7"','stroke-width="0.18"')
     (O/(v.Name.lower()+'.svg')).write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{bounds[2]-bounds[0]+4}mm" height="{bounds[3]-bounds[1]+4}mm" viewBox="{bounds[0]-2} {-bounds[3]-2} {bounds[2]-bounds[0]+4} {bounds[3]-bounds[1]+4}"><g transform="scale(1,-1)">{raw}</g></svg>')
     views[v.Name.lower()]={'bounds':bounds,'scale':scale,'visible_edges':len(v.getVisibleEdges())}
+if 'KeepUpdated' in page.PropertiesList:page.KeepUpdated=False
 d.saveAs(str(O/'building.FCStd'));A.closeDocument(d.Name)
-(O/'geometry-validation.json').write_text(json.dumps({'valid_solids':True,'object_count':len(visible),'balcony_count':len(registry),'views':views,'plan_cut_elevation_mm':plan_z+1250,'model_z_center_mm':(compound.BoundBox.ZMin+compound.BoundBox.ZMax)/2,'footprint_area_mm2':footprint_face.Area if footprint else W*D,'courtyard_count':len(footprint['rings'])-1 if footprint else 0,'roof_placeholder':bool(footprint)},indent=2))
+(O/'geometry-validation.json').write_text(json.dumps({'valid_solids':True,'wall_min_z_mm':min(v[2] for m in mesh if m['ifc_class']=='IfcWall' for v in m['vertices_mm']),'object_count':len(visible),'balcony_count':len(registry),'views':views,'plan_cut_elevation_mm':plan_z+1250,'model_z_center_mm':(compound.BoundBox.ZMin+compound.BoundBox.ZMax)/2,'footprint_area_mm2':footprint_face.Area if footprint else W*D,'courtyard_count':len(footprint['rings'])-1 if footprint else 0,'roof_placeholder':bool(footprint)},indent=2))
 
 # IFC4 exchange, generated from the exact meshes used for the render.
 import ifcopenshell,ifcopenshell.api,ifcopenshell.validate

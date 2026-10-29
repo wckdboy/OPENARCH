@@ -28,6 +28,7 @@ class Footprint(Strict):
     outer: Ring
     courtyards: list[Ring] = Field(default_factory=list, max_length=8)
     coordinate_system: Literal['image','cartesian'] = 'image'
+    projection: Literal['unknown','orthographic'] = 'unknown'
     mm_per_unit: Measure = Field(default_factory=Measure)
     source_page: str | None = None
     confidence: float = Field(default=0, ge=0, le=1)
@@ -115,6 +116,7 @@ def quality(spec: ModelSpec) -> dict:
         missing.append("levels")
     if spec.footprint:
         if spec.footprint.mm_per_unit.value_mm is None:missing.append('footprint scale')
+        if spec.footprint.coordinate_system=='image' and spec.footprint.projection!='orthographic':missing.append('orthographic source confirmation')
         if not spec.footprint.reviewed:review.append('footprint boundary')
         if not spec.footprint.mm_per_unit.reviewed:review.append('footprint scale')
         # Polygon roof topology is deliberately not invented from the perimeter.
@@ -141,8 +143,17 @@ def quality(spec: ModelSpec) -> dict:
         if not f:conflicts.append('Unknown opening facade: '+o.id)
         if f and f['length_mm'] and (o.x_mm + o.width_mm > f['length_mm'] or (h and o.z_mm + o.height_mm > h)):
             conflicts.append("Opening outside facade: " + o.id)
+    for i,a in enumerate(spec.openings):
+        for b in spec.openings[i+1:]:
+            if a.facade_id==b.facade_id and max(a.x_mm,b.x_mm)<min(a.x_mm+a.width_mm,b.x_mm+b.width_mm) and max(a.z_mm,b.z_mm)<min(a.z_mm+a.height_mm,b.z_mm+b.height_mm):
+                conflicts.append('Overlapping openings: '+a.id+', '+b.id)
+    opening_ids={o.id:o for o in spec.openings}
     active = [b for b in spec.balconies if b.status != "excluded"]
     for b in active:
+        if b.source_opening:
+            opening=opening_ids.get(b.source_opening)
+            if not opening:conflicts.append('Missing access opening: '+b.id)
+            elif opening.facade_id!=b.facade_id:conflicts.append('Access opening is on another facade: '+b.id)
         if b.level_id not in levels or levels[b.level_id] is None:
             conflicts.append("Missing balcony level: " + b.id)
         f=facades.get(b.facade_id)

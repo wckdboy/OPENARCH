@@ -11,6 +11,7 @@ from .schema import Strict,ModelSpec,quality
 from . import storage,pipeline
 from .intake import ALLOWED,MAX_FILE,MAX_TOTAL,calibration
 from .extract import suggest_balconies
+from .review import invalidate_dependents
 
 TOKEN=secrets.token_urlsafe(32)
 STATIC=Path(__file__).resolve().parent/'static'
@@ -37,6 +38,8 @@ async def local_boundary(request:Request,call_next):
 
 @app.exception_handler(ValueError)
 async def invalid(request,exc):return JSONResponse({'detail':str(exc)[:700]},422)
+@app.exception_handler(storage.BusyError)
+async def busy(request,exc):return JSONResponse({'detail':'Wait for the running project job'},409)
 @app.exception_handler(FileNotFoundError)
 async def missing(request,exc):return JSONResponse({'detail':'Project or file not found'},404)
 
@@ -67,11 +70,10 @@ def project(pid:str):return public_state(storage.read(pid))
 
 @app.post('/api/projects/{pid}/uploads')
 async def uploads(pid:str,files:list[UploadFile]=File(...)):
-    idle(pid);state=storage.read(pid)
-    if len(files)+len(state['files'])>30:raise HTTPException(413,'Maximum 30 source files')
-    storage.acquire(pid)
+    state=storage.acquire(pid)
     remaining=MAX_TOTAL-sum(f['bytes'] for f in state['files']);pending=[];root=storage.folder(pid);duplicates=[]
     try:
+        if len(files)>30:raise HTTPException(413,'Maximum 30 files in one upload')
         for upload in files:
             ext=Path(upload.filename or '').suffix.lower()
             if ext not in ALLOWED:raise HTTPException(415,'Upload PDF, PNG, JPG or WEBP. CAD client files are not accepted.')
@@ -79,12 +81,12 @@ async def uploads(pid:str,files:list[UploadFile]=File(...)):
             pending.append({'id':ident,'stored_name':path.name,'name':Path(upload.filename.replace('\\','/')).name[:160],'bytes':0,'sha256':''})
             with path.open('wb') as f:
                 while chunk:=await upload.read(1024*1024):
-                    size+=len(chunk);remaining-=len(chunk)
-                    if size>MAX_FILE or remaining<0:raise HTTPException(413,'Limit: 100 MB per file / 300 MB per project')
+                    size+=len(chunk)
+                    if size>MAX_FILE:raise HTTPException(413,'Limit: 100 MB per file')
                     f.write(chunk);sha.update(chunk)
             if size==0:raise HTTPException(422,'Empty file')
             # Signature check stops renamed non-image/non-PDF data before it reaches a parser.
-            head=path.read_bytes()[:16]
+            with path.open('rb') as header:head=header.read(16)
             if ext=='.pdf' and not head.startswith(b'%PDF-'):raise HTTPException(415,'Invalid PDF signature')
             if ext!='.pdf':
                 from PIL import Image
@@ -96,7 +98,11 @@ async def uploads(pid:str,files:list[UploadFile]=File(...)):
             pending[-1].update(bytes=size,sha256=sha.hexdigest())
             prior=next((f for f in [*state['files'],*pending[:-1]] if f['sha256']==sha.hexdigest()),None)
             if prior:
-                duplicates.append({'id':prior['id'],'name':pending[-1]['name']});path.unlink();pending.pop();remaining+=size
+                duplicates.append({'id':prior['id'],'name':pending[-1]['name']});path.unlink();pending.pop()
+            else:
+                remaining-=size
+                if remaining<0:raise HTTPException(413,'Limit: 300 MB per project')
+                if len(state['files'])+len(pending)>30:raise HTTPException(413,'Maximum 30 unique source files')
         def update(s):
             s['files'].extend(pending)
             for duplicate in duplicates:
@@ -120,15 +126,32 @@ class Analyze(Strict):
     auto_build:bool=True
 @app.post('/api/projects/{pid}/analyze')
 def analyze(pid:str,data:Analyze):
-    if not storage.read(pid)['files']:raise HTTPException(422,'Upload sources first')
-    if data.mode=='cloud':
-        if not data.cloud_consent:raise HTTPException(403,'Explicit opt-in is required for this cloud job')
-        if not pipeline.capabilities()['cloud']:raise HTTPException(422,'Cloud credentials/model are not configured')
-        if not data.page_ids:raise HTTPException(422,'Prepare pages locally and select 1-8 pages first')
-    storage.acquire(pid)
-    storage.event(pid,'queued','Analysis queued')
-    pipeline.EXECUTOR.submit(pipeline.analysis_job,pid,data.mode,data.cloud_consent,data.page_ids,data.auto_build)
+    with storage.LOCK:
+        state=storage.read(pid)
+        if not state['files']:raise HTTPException(422,'Upload sources first')
+        if data.mode=='cloud':
+            if not data.cloud_consent:raise HTTPException(403,'Explicit opt-in is required for this cloud job')
+            if not pipeline.capabilities()['cloud']:raise HTTPException(422,'Cloud credentials/model are not configured')
+            ids=set(data.page_ids)
+            if not ids or len(ids)!=len(data.page_ids) or not ids.issubset({p['id'] for p in state['pages']}):raise HTTPException(422,'Select 1-8 distinct existing pages')
+        queue_job(pid,'Analysis queued',pipeline.analysis_job,data.mode,data.cloud_consent,data.page_ids,data.auto_build)
     return {'queued':True}
+
+def queue_job(pid,message,worker,*args):
+    storage.acquire(pid)
+    try:
+        storage.event(pid,'queued',message)
+        pipeline.EXECUTOR.submit(worker,pid,*args)
+    except Exception:
+        storage.release(pid);storage.event(pid,'failed','The local worker could not accept this job. Retry after restarting the app.')
+        raise HTTPException(503,'Local worker unavailable') from None
+
+@app.get('/api/projects/{pid}/analysis-proposal')
+def analysis_proposal(pid:str):
+    state=storage.read(pid);proposal=state.get('analysis_proposal')
+    if not proposal:raise HTTPException(404,'No extraction proposal')
+    ident=storage.valid_id(proposal['id'])
+    return {**proposal,'current_revision':state['revision'],'spec':json.loads((storage.folder(pid)/'analysis-proposals'/(ident+'.json')).read_text(encoding='utf-8'))}
 
 class SpecEdit(Strict):
     revision:int
@@ -139,10 +162,7 @@ def edit_spec(pid:str,data:SpecEdit):
         idle(pid)
         if storage.read(pid)['revision']!=data.revision:raise HTTPException(409,'This project changed. Reload before saving.')
         old=ModelSpec.model_validate(storage.read(pid)['spec'])
-        if old.footprint!=data.spec.footprint:
-            for o in data.spec.openings:o.reviewed=False
-            for b in data.spec.balconies:
-                if b.status=='reviewed':b.status='proposed'
+        invalidate_dependents(old,data.spec)
         pipeline.save_spec(pid,data.spec,'Model specification updated locally')
     return public_state(storage.read(pid))
 
@@ -152,8 +172,9 @@ class Proposal(Strict):
     include_windows:bool=False
 @app.post('/api/projects/{pid}/suggest')
 def propose(pid:str,data:Proposal):
-    idle(pid);spec=ModelSpec.model_validate(storage.read(pid)['spec'])
-    pipeline.save_spec(pid,suggest_balconies(spec,data.width_mm,data.depth_mm,data.include_windows),'Balcony proposals added without duplicating existing IDs')
+    with storage.LOCK:
+        idle(pid);spec=ModelSpec.model_validate(storage.read(pid)['spec'])
+        pipeline.save_spec(pid,suggest_balconies(spec,data.width_mm,data.depth_mm,data.include_windows),'Balcony proposals added without duplicating existing IDs')
     return public_state(storage.read(pid))
 
 class PageEdit(Strict):
@@ -162,7 +183,6 @@ class PageEdit(Strict):
     known_mm:float|None=None
 @app.put('/api/projects/{pid}/pages/{page_id}')
 def edit_page(pid:str,page_id:str,data:PageEdit):
-    idle(pid)
     def update(s):
         page=next((p for p in s['pages'] if p['id']==page_id),None)
         if page is None:raise ValueError('Page not found')
@@ -170,13 +190,23 @@ def edit_page(pid:str,page_id:str,data:PageEdit):
         if data.points is not None:
             if len(data.points)!=2 or any(len(p)!=2 for p in data.points) or data.known_mm is None:raise ValueError('Choose two points and a known dimension')
             page['calibration']=calibration(*data.points[0],*data.points[1],data.known_mm,page['width_px'],page['height_px'])
-    storage.mutate(pid,update);return public_state(storage.read(pid))
+    with storage.LOCK:
+        idle(pid);before=storage.read(pid);storage.mutate(pid,update);after=storage.read(pid)
+        old_page=next(p for p in before['pages'] if p['id']==page_id);new_page=next(p for p in after['pages'] if p['id']==page_id)
+        if old_page.get('calibration')!=new_page.get('calibration'):
+            spec=ModelSpec.model_validate(after['spec']);fp=spec.footprint
+            if fp and fp.source_page==page_id and fp.mm_per_unit.method=='calibrated':
+                fp.mm_per_unit.value_mm=None;fp.mm_per_unit.reviewed=False;fp.reviewed=False
+                spec=ModelSpec.model_validate(spec.model_dump());invalidate_dependents(ModelSpec.model_validate(before['spec']),spec)
+                pipeline.save_spec(pid,spec,'Source calibration changed. Apply the new calibration to the footprint and review affected placements.')
+    return public_state(storage.read(pid))
 
 @app.post('/api/projects/{pid}/build')
 def build(pid:str):
-    s=storage.read(pid);q=quality(ModelSpec.model_validate(s['spec']))
-    if not q['can_build_draft']:raise HTTPException(422,'Missing dimensions or geometry conflicts')
-    storage.acquire(pid);storage.event(pid,'queued','Model build queued');pipeline.EXECUTOR.submit(pipeline.build_job,pid)
+    with storage.LOCK:
+        s=storage.read(pid);q=quality(ModelSpec.model_validate(s['spec']))
+        if not q['can_build_draft']:raise HTTPException(422,'Missing dimensions or geometry conflicts')
+        queue_job(pid,'Model build queued',pipeline.build_job)
     return {'queued':True}
 
 @app.get('/api/projects/{pid}/pages/{name}')

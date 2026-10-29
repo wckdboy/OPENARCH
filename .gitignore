@@ -14,6 +14,8 @@ outputs/
 *.rfa
 *.ls10
 *.FCStd
+*.FCStd*
+*.fcstd*
 *.FCBak
 *.ifc
 *.blend*

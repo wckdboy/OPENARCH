@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 LOCK = threading.RLock()
 REPO = Path(__file__).resolve().parent.parent
 
+class BusyError(ValueError):
+    pass
+
 def data_root() -> Path:
     default = Path(os.environ.get("LOCALAPPDATA", Path.home()/".local"/"share"))/"OPENARCH"
     root = Path(os.environ.get("OPENARCH_DATA_DIR", default)).expanduser().resolve()
@@ -57,8 +60,8 @@ def event(pid, stage, message):
 def acquire(pid):
     with LOCK:
         s=read(pid)
-        if s["busy"]:raise ValueError("A job is already running for this project")
-        mutate(pid,lambda x:x.update(busy=True))
+        if s["busy"]:raise BusyError("A job is already running for this project")
+        return mutate(pid,lambda x:x.update(busy=True))
 
 def release(pid):
     mutate(pid,lambda x:x.update(busy=False))

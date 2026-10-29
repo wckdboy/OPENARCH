@@ -1,6 +1,12 @@
 'use strict';
 const $=id=>document.getElementById(id);
 let config,project=null,currentTab='sources',selectedPages=new Set(),page=null,points=[],pageImage=null;
+let selectionEpoch=0,actionInFlight=false,pollInFlight=false,dirty=false;
+const dirtyEditors=new Set();
+function markDirty(editor='form'){dirty=true;dirtyEditors.add(editor);$('unsaved').hidden=false;}
+function clearDirty(){dirty=false;dirtyEditors.clear();$('unsaved').hidden=true;}
+function requireSaved(){if(dirty)throw new Error('Save or discard your unsaved changes first.');}
+function requireEditor(editor){if([...dirtyEditors].some(value=>value!==editor))throw new Error('The form and advanced JSON have separate edits. Copy the values you need, then discard and use one editor to save.');}
 const labels={width:'Facade width',depth:'Building depth',eaves:'Eaves height',roof_rise:'Roof rise',wall_thickness:'Wall thickness'};
 function node(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;}
 function error(e){$('error').textContent=e.message||String(e);$('error').hidden=false;}
@@ -10,14 +16,14 @@ async function api(url,method='GET',body){
   const r=await fetch(url,{method,headers,body});const data=await r.json();
   if(!r.ok)throw new Error(typeof data.detail==='string'?data.detail:JSON.stringify(data.detail));return data;
 }
-function guard(fn){return async e=>{try{$('error').hidden=true;await fn(e);}catch(err){error(err);}};}
+function guard(fn){return async e=>{e?.preventDefault?.();if(actionInFlight){error(new Error('Wait for the current action to finish.'));return;}actionInFlight=true;$('workspace').inert=true;try{$('error').hidden=true;await fn(e);}catch(err){error(err);}finally{actionInFlight=false;$('workspace').inert=false;}};}
 function endpoint(path=''){return '/api/projects/'+project.id+path;}
-function setTab(name){currentTab=name;for(const b of document.querySelectorAll('[data-tab]'))b.classList.toggle('active',b.dataset.tab===name);for(const p of document.querySelectorAll('.panel'))p.hidden=p.id!=='tab-'+name;}
+function setTab(name){if(name!==currentTab&&dirty){error(new Error('Save or discard your unsaved changes before changing sections.'));return;}currentTab=name;for(const b of document.querySelectorAll('[data-tab]'))b.classList.toggle('active',b.dataset.tab===name);for(const p of document.querySelectorAll('.panel'))p.hidden=p.id!=='tab-'+name;}
 async function projectList(){
   const list=await api('/api/projects');$('project-list').replaceChildren();
   for(const p of list){const b=node('button','project-item'+(project?.id===p.id?' active':''),p.name);b.dataset.project=p.id;b.append(node('span','',p.status.replaceAll('_',' ')));b.onclick=guard(()=>openProject(p.id));$('project-list').append(b);}
 }
-async function openProject(id){project=await api('/api/projects/'+id);selectedPages.clear();render();await projectList();}
+async function openProject(id){requireSaved();const epoch=++selectionEpoch;const next=await api('/api/projects/'+id);if(epoch!==selectionEpoch)return;project=next;clearDirty();selectedPages.clear();$('cloud-consent').checked=false;render();await projectList();}
 function progress(){
   const busy=project.busy;$('status').textContent=project.status.replaceAll('_',' ');$('revision').textContent='Revision '+project.revision;
   $('job-progress').hidden=!busy;const ev=project.events.at(-1);$('job-stage').textContent=ev?.stage||'Processing';$('job-message').textContent=ev?.message||'';
@@ -47,6 +53,7 @@ function measureCard(key,m){
   card.append(label,node('small','',m.method+(m.source_page?' · source '+m.source_page.slice(-9):' · no source reference')),check);return card;
 }
 function renderEvidence(){
+  $('analysis-proposal').hidden=!project.analysis_proposal;
   const q=project.quality;$('quality').replaceChildren();for(const [num,label] of [[q.missing.length,'Missing inputs'],[q.review.length,'Items to review'],[q.conflicts.length,'Geometry conflicts']]){const c=node('div','quality-card');c.append(node('strong','',num),node('span','',label));$('quality').append(c);}
   $('measures').replaceChildren();for(const [key,label] of Object.entries(labels))$('measures').append(measureCard(key,project.spec[key]));
   $('levels').replaceChildren();for(const l of project.spec.levels)addLevelRow(l.id,l.elevation);
@@ -85,7 +92,19 @@ function addLevelRow(id='',m={value_mm:null,reviewed:false}){
   const label=node('label','check');const cb=node('input');cb.type='checkbox';cb.checked=m.reviewed;cb.dataset.key='reviewed';label.append(cb,node('span','','Reviewed'));input.oninput=()=>cb.checked=false;row.append(name,input,label);$('levels').append(row);
 }
 function readMeasure(card,old){const value=card.querySelector('[data-value]').value;const n=value===''?null:Number(value);const m={...old,value_mm:n,reviewed:card.querySelector('[data-review]').checked};if(n!==old.value_mm){m.method='manual';m.source_page=null;m.confidence=0;}return m;}
-async function saveSpec(spec){project=await api(endpoint('/spec'),'PUT',{revision:project.revision,spec});render();}
+async function saveSpec(spec){const id=project.id,epoch=selectionEpoch;const next=await api('/api/projects/'+id+'/spec','PUT',{revision:project.revision,spec});if(project?.id!==id||epoch!==selectionEpoch)return;project=next;clearDirty();render();}
+function readReviewSpec(){
+  requireEditor('form');
+  const spec=structuredClone(project.spec);
+  for(const card of $('measures').children)spec[card.dataset.measure]=readMeasure(card,spec[card.dataset.measure]);
+  spec.levels=[...$('levels').children].map(row=>{
+    const old=project.spec.levels.find(l=>l.id===row.dataset.original)?.elevation||{value_mm:null,source_page:null,method:'unknown',confidence:0,reviewed:false};
+    const val=row.querySelector('[data-key=elevation]').value,value=val===''?null:Number(val);
+    return {id:row.querySelector('[data-key=id]').value,elevation:{...old,value_mm:value,reviewed:row.querySelector('[data-key=reviewed]').checked,...(value!==old.value_mm?{method:'manual',source_page:null,confidence:0}:{})}};
+  });
+  spec.openings=readOpenings();
+  return spec;
+}
 function renderBalconies(){
   $('balcony-rows').replaceChildren();
   for(const b of project.spec.balconies){const tr=node('tr');tr.dataset.id=b.id;tr.append(node('td','',b.id));
@@ -114,28 +133,45 @@ function drawPage(){const canvas=$('page-canvas');canvas.width=page.width_px;can
   let msg=points.length+' of 2 points selected.';if(page.calibration)msg+=' Saved scale: '+page.calibration.mm_per_px.toFixed(3)+' mm/px.';
   if(points.length===2&&page.calibration)msg+=' Selected distance: '+Math.round(Math.hypot(points[1][0]-points[0][0],points[1][1]-points[0][1])*page.calibration.mm_per_px)+' mm.';$('calibration-state').textContent=msg;
 }
-async function localAnalyze(){await api(endpoint('/analyze'),'POST',{mode:'local',auto_build:true});project=await api(endpoint());render();}
+async function localAnalyze(){requireSaved();await api(endpoint('/analyze'),'POST',{mode:'local',auto_build:true});project=await api(endpoint());render();}
 async function init(){
-  config=await api('/api/config');bindFootprint();$('page-filter').onchange=renderSources;await projectList();
+  config=await api('/api/config');bindFootprint();
+  $('workspace').addEventListener('input',e=>{if(e.target.closest('#measures,#levels,#opening-rows,#balcony-rows,#spec-json')||e.target.id==='footprint-reviewed')markDirty(e.target.id==='spec-json'?'json':'form');});
+  $('workspace').addEventListener('change',e=>{if(e.target.closest('#opening-rows,#balcony-rows'))markDirty();});
+  $('discard-edits').onclick=guard(async()=>{const id=project.id;clearDirty();await openProject(id);});
+  $('compare-extraction').onclick=guard(async()=>{const result=await api(endpoint('/analysis-proposal'));$('proposal-json').textContent=JSON.stringify(result.spec,null,2);$('proposal-details').textContent='Extraction from revision '+result.base_revision+'. Current revision '+project.revision+'. Copy verified values into Review evidence; your saved model is unchanged.';$('proposal-dialog').showModal();});
+  $('close-proposal').onclick=()=>$('proposal-dialog').close();$('page-filter').onchange=renderSources;await projectList();
   for(const b of document.querySelectorAll('[data-tab]'))b.onclick=()=>setTab(b.dataset.tab);
   for(const b of document.querySelectorAll('[data-view]'))b.onclick=()=>{$('vector-preview').src=runUrl(b.dataset.view+'.svg');};
-  for(const id of ['new-project','start-project'])$(id).onclick=()=>{$('new-dialog').showModal();$('project-name').focus();};$('cancel-new').onclick=()=>$('new-dialog').close();
+  for(const id of ['new-project','start-project'])$(id).onclick=guard(()=>{requireSaved();$('new-dialog').showModal();$('project-name').focus();});$('cancel-new').onclick=()=>$('new-dialog').close();
   $('new-form').onsubmit=guard(async e=>{e.preventDefault();project=await api('/api/projects','POST',{name:$('project-name').value});$('new-dialog').close();$('new-form').reset();currentTab='sources';render();await projectList();});
   $('demo').onclick=guard(async()=>{$('demo').disabled=true;try{project=await api('/api/demo','POST');currentTab='outputs';render();await projectList();await localAnalyze();}finally{$('demo').disabled=false;}});
   $('source-files').onchange=()=>{$('selected-files').textContent=[...$('source-files').files].map(f=>f.name).join(', ');};
   $('upload-form').onsubmit=guard(async e=>{e.preventDefault();if(project.busy)throw new Error('Wait for the current job');const body=new FormData();for(const f of $('source-files').files)body.append('files',f);project=await api(endpoint('/uploads'),'POST',body);$('upload-form').reset();$('selected-files').textContent='';render();await localAnalyze();});
   $('analyze-local').onclick=guard(localAnalyze);
-  $('cloud-analyze').onclick=guard(async()=>{if(!$('cloud-consent').checked)throw new Error('Opt in for this job before sending pages.');if(selectedPages.size<1||selectedPages.size>8)throw new Error('Select between 1 and 8 prepared pages.');await api(endpoint('/analyze'),'POST',{mode:'cloud',cloud_consent:true,page_ids:[...selectedPages],auto_build:true});$('cloud-consent').checked=false;project=await api(endpoint());render();});
-  $('save-evidence').onclick=guard(async()=>{const spec=structuredClone(project.spec);for(const card of $('measures').children)spec[card.dataset.measure]=readMeasure(card,spec[card.dataset.measure]);spec.levels=[...$('levels').children].map(row=>{const old=project.spec.levels.find(l=>l.id===row.dataset.original)?.elevation||{value_mm:null,source_page:null,method:'unknown',confidence:0,reviewed:false};const val=row.querySelector('[data-key=elevation]').value;const value=val===''?null:Number(val);return {id:row.querySelector('[data-key=id]').value,elevation:{...old,value_mm:value,reviewed:row.querySelector('[data-key=reviewed]').checked,...(value!==old.value_mm?{method:'manual',source_page:null,confidence:0}:{})}};});await saveSpec(spec);});
-  $('add-level').onclick=()=>addLevelRow();$('save-json').onclick=guard(()=>saveSpec(JSON.parse($('spec-json').value)));
-  $('add-opening').onclick=()=>{addOpeningRow({id:'manual-'+crypto.randomUUID().slice(0,8),facade_id:$('facade-choice').value||project.facades?.[0]?.id||'front',x_mm:500,z_mm:800,width_mm:1200,height_mm:1600,kind:'window',reviewed:false});drawFacade(readOpenings());};
-  $('save-openings').onclick=guard(async()=>{const spec=structuredClone(project.spec);spec.openings=readOpenings();await saveSpec(spec);});
-  $('suggest').onclick=guard(async()=>{project=await api(endpoint('/suggest'),'POST',{width_mm:Number($('proposal-width').value),depth_mm:Number($('proposal-depth').value),include_windows:$('include-windows').checked});render();});
+  $('cloud-analyze').onclick=guard(async()=>{requireSaved();if(!$('cloud-consent').checked)throw new Error('Opt in for this job before sending pages.');if(selectedPages.size<1||selectedPages.size>8)throw new Error('Select between 1 and 8 prepared pages.');await api(endpoint('/analyze'),'POST',{mode:'cloud',cloud_consent:true,page_ids:[...selectedPages],auto_build:true});$('cloud-consent').checked=false;project=await api(endpoint());render();});
+  $('save-evidence').onclick=guard(()=>saveSpec(readReviewSpec()));
+  $('add-level').onclick=()=>{addLevelRow();markDirty();};$('save-json').onclick=guard(()=>{requireEditor('json');return saveSpec(JSON.parse($('spec-json').value));});
+  $('add-opening').onclick=()=>{markDirty();addOpeningRow({id:'manual-'+crypto.randomUUID().slice(0,8),facade_id:$('facade-choice').value||project.facades?.[0]?.id||'front',x_mm:500,z_mm:800,width_mm:1200,height_mm:1600,kind:'window',reviewed:false});drawFacade(readOpenings());};
+  $('save-openings').onclick=guard(()=>saveSpec(readReviewSpec()));
+  $('suggest').onclick=guard(async()=>{requireSaved();project=await api(endpoint('/suggest'),'POST',{width_mm:Number($('proposal-width').value),depth_mm:Number($('proposal-depth').value),include_windows:$('include-windows').checked});render();});
   $('save-balconies').onclick=guard(async()=>{const spec=structuredClone(project.spec);for(const row of $('balcony-rows').querySelectorAll('[data-id]')){const b=spec.balconies.find(b=>b.id===row.dataset.id);for(const input of row.querySelectorAll('[data-key]'))b[input.dataset.key]=input.type==='number'?Number(input.value):input.value;}await saveSpec(spec);});
-  $('build').onclick=guard(async()=>{await api(endpoint('/build'),'POST');project=await api(endpoint());render();});
+  $('build').onclick=guard(async()=>{requireSaved();await api(endpoint('/build'),'POST');project=await api(endpoint());render();});
   $('close-page').onclick=()=>$('page-dialog').close();$('clear-points').onclick=()=>{points=[];drawPage();};
   $('page-canvas').onclick=e=>{const rect=e.currentTarget.getBoundingClientRect();if(points.length===2)points=[];points.push([(e.clientX-rect.left)*page.width_px/rect.width,(e.clientY-rect.top)*page.height_px/rect.height]);drawPage();};
   $('save-page').onclick=guard(async()=>{if(points.length===1)throw new Error('Select the second calibration point.');project=await api(endpoint('/pages/'+page.id),'PUT',{kind:$('page-kind').value,points:points.length===2?points:null,known_mm:points.length===2?Number($('known-mm').value):null});$('page-dialog').close();render();});
-  setInterval(async()=>{if(!project)return;try{const next=await api(endpoint());const changed=next.revision!==project.revision||next.pages.length!==project.pages.length||next.runs.length!==project.runs.length;project=next;if(changed)render();else progress();}catch(e){error(e);}},2000);
+  setInterval(pollProject,2000);
 }
+async function pollProject(){
+  if(!project||pollInFlight||actionInFlight)return;
+  const id=project.id,epoch=selectionEpoch,revision=project.revision;pollInFlight=true;
+  try{
+    const next=await api('/api/projects/'+id);
+    if(project?.id!==id||selectionEpoch!==epoch||project.revision!==revision||actionInFlight)return;
+    const changed=next.revision!==revision||next.pages.length!==project.pages.length||next.runs.length!==project.runs.length||next.analysis_proposal?.id!==project.analysis_proposal?.id;
+    if(dirty){if(changed)error(new Error('The saved project changed while you were editing. Your local edits were kept; discard them to load the saved version.'));return;}
+    project=next;if(changed)render();else progress();
+  }catch(e){if(project?.id===id&&selectionEpoch===epoch)error(e);}finally{pollInFlight=false;}
+}
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
 init().catch(error);
