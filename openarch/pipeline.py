@@ -1,6 +1,6 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import os,json,subprocess,uuid,shutil
+import os,json,subprocess,uuid,shutil,sys
 from . import storage
 from .schema import ModelSpec,quality
 from .intake import ingest
@@ -28,12 +28,26 @@ def save_spec(pid,spec,reason):
 def analysis_job(pid,mode,consent,page_ids,auto_build):
     try:
         state=storage.read(pid)
-        pages=state['pages'] or ingest(pid)
+        if not state['pages'] or state.get('pages_pending'):
+            env=os.environ.copy();env.pop('OPENAI_API_KEY',None)
+            run_worker(sys.executable,['-m','openarch.intake_worker',pid],env,storage.folder(pid)/'intake.log','INTAKE_COMPLETE',300)
+        pages=storage.read(pid)['pages']
         storage.event(pid,'interpreting','Interpreting source evidence locally' if mode=='local' else 'Sending selected page previews/text to opted-in cloud service')
         if mode=='cloud':
             chosen=[p for p in pages if p['id'] in page_ids]
             spec=cloud_extract(chosen,storage.folder(pid),consent)
         else:spec=local_extract(pages)
+        # A new interpretation must not silently discard a traced footprint.
+        previous=ModelSpec.model_validate(state['spec'])
+        if previous.footprint:
+            spec.footprint=previous.footprint
+            spec.openings=previous.openings
+            spec.balconies=previous.balconies
+            for key in ['eaves','roof_rise','wall_thickness']:
+                if getattr(spec,key).value_mm is None:setattr(spec,key,getattr(previous,key).model_copy())
+            if not spec.levels:spec.levels=previous.levels
+            spec.notes=list(dict.fromkeys([*previous.notes,*spec.notes]))[:100]
+            spec=ModelSpec.model_validate(spec.model_dump())
         spec=suggest_balconies(spec)
         save_spec(pid,spec,'Draft evidence extracted. Review dimensions and proposed balconies.')
         if auto_build and quality(spec)['can_build_draft'] and capabilities()['freecad']:
@@ -64,7 +78,9 @@ def build_job(pid,release=True):
         fc=os.environ.get('FREECAD_CMD') or shutil.which('FreeCADCmd') or shutil.which('FreeCADCmd.exe')
         if not fc:raise ValueError('Set FREECAD_CMD to your FreeCADCmd executable')
         run_id=str(uuid.uuid4());run=storage.folder(pid)/'runs'/run_id;run.mkdir()
-        storage.atomic(run/'spec.json',spec.model_dump());storage.atomic(run/'job.json',{'project_id':pid,'revision':state['revision'],'output':str(run),'spec':spec.model_dump()})
+        from .footprint import geometry,facade_map
+        storage.atomic(run/'spec.json',spec.model_dump());storage.atomic(run/'job.json',{'project_id':pid,'revision':state['revision'],'output':str(run),'spec':spec.model_dump(),
+            'footprint_geometry':geometry(spec.footprint) if spec.footprint else None,'facades':facade_map(spec)})
         storage.event(pid,'modelling','Building native FreeCAD solids, views and IFC')
         # FreeCAD's document temp names are long; keep the profile outside UUID run paths.
         profile=storage.data_root()/'.freecad-profile';profile.mkdir(exist_ok=True);env=os.environ.copy()

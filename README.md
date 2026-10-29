@@ -2,7 +2,7 @@
 
 A local application for turning architectural PDFs and photographs into a reviewed specification, a FreeCAD model, drawing sheets, an IFC exchange model, Blender visuals and a balcony register.
 
-**Early functional prototype.** The aim is to automate most first-draft work; a 90-95% completion or accuracy claim has **not** been established. Current scope is one rectangular building envelope and its front facade. Complex courtyards, multiple wings, irregular roofs, interior layouts and construction detailing are outside this version.
+**Early functional prototype.** The aim is to automate most first-draft work; a 90-95% completion or accuracy claim has **not** been established. The original rectangular workflow is joined by traced polygon footprints with courtyard voids and facade-specific openings/balconies. Polygon roofs are flat placeholders, all wings share one eaves height, and these outputs remain drafts. Automatic tracing of arbitrary scans, pitched multi-wing roofs, interior layouts and construction detailing are outside this version.
 
 ## Run locally
 
@@ -32,17 +32,20 @@ The integration was exercised with FreeCAD 1.1.4 (including IfcOpenShell 0.8.4) 
 
 ## Workflow
 
-1. Create a project and upload PDFs, PNGs, JPGs or WEBP images. Local analysis starts automatically.
+1. Create a project and upload PDFs, PNGs, JPGs or WEBP images (100 MB per file, 300 MB and 100 pages per project). Local analysis starts automatically. Identical files are stored once, with alternate filenames recorded as aliases. Saved HTML download pages are not drawings and are not accepted.
 2. The app renders pages, extracts PDF text, optionally runs Tesseract OCR, and identifies explicit named dimensions and rectilinear vector facade openings.
 3. Missing/conflicting values stop model generation. Known but unreviewed values can generate a clearly labelled draft.
-4. Inspect source pages, calibrate a known distance, review dimensions, edit floor levels and adjust balcony proposals. Advanced JSON editing covers opening positions and other specification fields.
-5. Generate a revisioned package. It includes FCStd, IFC4, SVG views, PDF drawing sheets, CSV/JSON register, source-evidence report and checksums. With Blender configured it also includes PNG, BLEND and GLB.
+4. Inspect source pages and calibrate a known distance. In **Footprint**, trace the outer boundary and enclosed courtyards. Unscaled traces can be saved but cannot generate a metric model. Apply calibration only to an orthographic drawing; oblique photos need rectification.
+5. Review dimensions and floor levels, choose a facade edge for each opening/balcony, and edit positions in the tables. Facade offsets run from the displayed edge origin in its local direction. Advanced JSON remains available.
+6. Generate a revisioned package. It includes FCStd, IFC4, SVG views, PDF drawing sheets, CSV/JSON register, source-evidence report and checksums. With Blender configured it also includes PNG, BLEND and GLB.
 
 The app's saved specification is authoritative. Direct FreeCAD/Blender edits are not imported back into the app; a new generated revision will use the saved specification. Prior runs remain separate. IFC is a tessellated exchange copy, not a round-trip replacement for native parametric objects.
 
 ### What local extraction can do
 
 It recognizes explicit labels such as `Facade width: 12000 mm`, `Building depth: 8000 mm`, `Eaves height: 10000 mm`, `Wall thickness: 400 mm` and `Level L1: 3200 mm`, with selected Danish equivalents. It proposes rectangular openings when a vector elevation contains an unambiguous facade rectangle matching the extracted aspect ratio. These are candidates, not verified measurements.
+
+PDF decoding runs in a separate local process. Set `PDFTOPPM_EXE` to a Poppler `pdftoppm` executable for isolated per-page rasterization; otherwise the child process uses PDFium. Existing previews keep their pixel coordinates so saved calibration is preserved.
 
 Arbitrary old scans do not follow this controlled pattern. For them, configure `TESSERACT_CMD` for local OCR, use calibration/manual review, or explicitly opt into cloud vision. Page calibration provides a pixel-to-mm measurement aid and is passed to the cloud adapter; it does not automatically trace an entire plan or rectify oblique photographs. A printed scale on a mixed-scale sheet is not blindly applied to every drawing.
 
@@ -69,7 +72,7 @@ The adapter is covered by mocked contract/consent tests. Live cloud extraction h
 
 ## Validation and limitations
 
-The test suite covers synthetic PDF interpretation, stable proposal IDs, conflicting dimensions, geometry conflicts, calibration, private storage, traversal rejection, upload validation, stale revisions and cloud consent. Native CAD/Blender integration is tested separately when those applications are installed.
+The test suite covers synthetic PDF interpretation, stable proposal IDs, conflicting dimensions, geometry conflicts, calibration, private storage, traversal rejection, upload deduplication, stale revisions and cloud consent. Polygon tests cover unscaled traces, invalid boundaries, courtyard containment, facade identity and balcony collisions across different facades. Native CAD/Blender integration is tested separately when those applications are installed.
 
 `reviewed_measurements / measurement_count` is an **evidence-review count**, never a geometric accuracy percentage. IFC schema validation is not structural or regulatory validation. Baluster profiles, cornices, roof form and attachments are simplified for draft sales models. Picket counts are chosen at generation time; rerun the app after dimension changes to recalculate them.
 

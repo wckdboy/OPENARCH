@@ -5,8 +5,8 @@ import pdfplumber
 import pypdfium2 as pdfium
 from . import storage
 
-MAX_FILE=30*1024*1024
-MAX_TOTAL=120*1024*1024
+MAX_FILE=100*1024*1024
+MAX_TOTAL=300*1024*1024
 MAX_PAGES=100
 ALLOWED={".pdf",".png",".jpg",".jpeg",".webp"}
 
@@ -26,6 +26,8 @@ def ocr(path):
 def ingest(pid):
     """Called by the single worker: PDFium is not thread-safe."""
     state=storage.read(pid);root=storage.folder(pid);pages=[]
+    old={p['id']:p for p in state['pages']}
+    poppler=os.environ.get('PDFTOPPM_EXE') or shutil.which('pdftoppm')
     for src in state["files"]:
         if len(pages)>=MAX_PAGES:raise ValueError("Limit: 100 pages per project")
         path=root/"sources"/src["stored_name"]
@@ -34,14 +36,22 @@ def ingest(pid):
                 if len(renderdoc)+len(pages)>MAX_PAGES:raise ValueError("Limit: 100 pages per project")
                 for i,page in enumerate(textdoc.pages):
                     ident=f"{src['id']}-{i+1}"
-                    rp=renderdoc[i];scale=min(2.2,1800/max(rp.get_size()))
-                    bmp=rp.render(scale=scale);img=bmp.to_pil().convert("RGB")
-                    target=root/"pages"/(ident+".png");img.save(target)
+                    target=root/"pages"/(ident+".png")
+                    if ident in old and target.is_file():
+                        # Preserve the pixel coordinate system of saved calibration/traces.
+                        with Image.open(target) as rendered:img=rendered.convert('RGB')
+                    elif poppler:
+                        result=subprocess.run([poppler,'-f',str(i+1),'-l',str(i+1),'-singlefile','-scale-to','2200','-png',str(path),str(target.with_suffix(''))],capture_output=True,timeout=90,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                        if result.returncode or not target.is_file():raise ValueError('PDF page rendering failed')
+                        with Image.open(target) as rendered:img=rendered.convert('RGB')
+                    else:
+                        rp=renderdoc[i];scale=min(2.2,2200/max(rp.get_size()))
+                        bmp=rp.render(scale=scale);img=bmp.to_pil().convert("RGB");img.save(target)
+                        bmp.close();rp.close()
                     txt=(page.extract_text() or "")[:100000];warning=None
                     if len(txt.strip())<20:txt,warning=ocr(target)
                     rects=[{"x":r['x0'],"y":r['top'],"w":r['width'],"h":r['height']} for r in page.rects[:3000] if r['width']>1 and r['height']>1]
                     pages.append({"id":ident,"file_id":src['id'],"number":i+1,"kind":kind(txt),"text":txt,"width_px":img.width,"height_px":img.height,"width_pt":page.width,"height_pt":page.height,"rects":rects,"preview":ident+".png","warning":warning,"calibration":None})
-                    bmp.close();rp.close()
         else:
             with Image.open(path) as raw:
                 if raw.width*raw.height>30_000_000:raise ValueError("Image exceeds 30 megapixels")
@@ -50,7 +60,10 @@ def ingest(pid):
                 txt,warning=ocr(target)
                 pages.append({"id":ident,"file_id":src['id'],"number":1,"kind":kind(txt),"text":txt,"width_px":img.width,"height_px":img.height,"width_pt":None,"height_pt":None,"rects":[],"preview":ident+".png","warning":warning,"calibration":None})
         storage.event(pid,"intake",f"Prepared {len(pages)} pages")
-    storage.mutate(pid,lambda s:s.update(pages=pages))
+    for p in pages:
+        if p['id'] in old:
+            p['kind']=old[p['id']]['kind'];p['calibration']=old[p['id']].get('calibration')
+    storage.mutate(pid,lambda s:s.update(pages=pages,pages_pending=False))
     return pages
 
 def calibration(x1,y1,x2,y2,known_mm,width,height):

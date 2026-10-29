@@ -86,6 +86,9 @@ def cloud_extract(pages,root:Path,consent:bool,transport=None):
     chunks=[c['text'] for o in response.get('output',[]) if o.get('type')=='message' for c in o.get('content',[]) if c.get('type')=='output_text']
     if not chunks:raise ValueError("Cloud service returned no structured interpretation")
     spec=ModelSpec.model_validate_json(''.join(chunks));ids={p['id'] for p in pages}
+    if spec.footprint:
+        spec.footprint.reviewed=False;spec.footprint.mm_per_unit.reviewed=False
+        if spec.footprint.source_page not in ids:spec.footprint.source_page=None;spec.footprint.confidence=0
     for key in LABELS:
         m=getattr(spec,key);m.reviewed=False
         if m.source_page not in ids:m.source_page=None;m.method='inferred';m.confidence=min(m.confidence,.3)
@@ -106,5 +109,5 @@ def suggest_balconies(spec:ModelSpec,width=2400,depth=1300,include_windows=False
         if not candidates:continue
         level=min(candidates,key=lambda l:abs(o.z_mm-l.elevation.value_mm))
         # Stable proposal ID: re-running does not create duplicate placements.
-        spec.balconies.append(Balcony(id='balcony-'+uuid.uuid5(uuid.NAMESPACE_URL,o.id).hex[:16],level_id=level.id,center_x_mm=o.x_mm+o.width_mm/2,width_mm=width,depth_mm=depth,source_opening=o.id))
+        spec.balconies.append(Balcony(id='balcony-'+uuid.uuid5(uuid.NAMESPACE_URL,o.id).hex[:16],level_id=level.id,center_x_mm=o.x_mm+o.width_mm/2,width_mm=width,depth_mm=depth,source_opening=o.id,facade_id=o.facade_id))
     return spec

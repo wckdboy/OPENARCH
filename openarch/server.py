@@ -41,7 +41,8 @@ async def invalid(request,exc):return JSONResponse({'detail':str(exc)[:700]},422
 async def missing(request,exc):return JSONResponse({'detail':'Project or file not found'},404)
 
 def public_state(s):
-    value=dict(s);value['quality']=quality(ModelSpec.model_validate(s['spec']))
+    from .footprint import facade_map
+    value=dict(s);spec=ModelSpec.model_validate(s['spec']);value['spec']=spec.model_dump();value['quality']=quality(spec);value['facades']=list(facade_map(spec).values())
     # OCR text is available in the review screen, but filesystem paths never are.
     return value
 
@@ -69,7 +70,7 @@ async def uploads(pid:str,files:list[UploadFile]=File(...)):
     idle(pid);state=storage.read(pid)
     if len(files)+len(state['files'])>30:raise HTTPException(413,'Maximum 30 source files')
     storage.acquire(pid)
-    remaining=MAX_TOTAL-sum(f['bytes'] for f in state['files']);pending=[];root=storage.folder(pid)
+    remaining=MAX_TOTAL-sum(f['bytes'] for f in state['files']);pending=[];root=storage.folder(pid);duplicates=[]
     try:
         for upload in files:
             ext=Path(upload.filename or '').suffix.lower()
@@ -79,7 +80,7 @@ async def uploads(pid:str,files:list[UploadFile]=File(...)):
             with path.open('wb') as f:
                 while chunk:=await upload.read(1024*1024):
                     size+=len(chunk);remaining-=len(chunk)
-                    if size>MAX_FILE or remaining<0:raise HTTPException(413,'Limit: 30 MB per file / 120 MB per project')
+                    if size>MAX_FILE or remaining<0:raise HTTPException(413,'Limit: 100 MB per file / 300 MB per project')
                     f.write(chunk);sha.update(chunk)
             if size==0:raise HTTPException(422,'Empty file')
             # Signature check stops renamed non-image/non-PDF data before it reaches a parser.
@@ -93,7 +94,16 @@ async def uploads(pid:str,files:list[UploadFile]=File(...)):
                         img.verify()
                 except Exception:raise HTTPException(415,'Invalid or oversized image') from None
             pending[-1].update(bytes=size,sha256=sha.hexdigest())
-        def update(s):s['files'].extend(pending);s['pages']=[];s['status']='uploaded'
+            prior=next((f for f in [*state['files'],*pending[:-1]] if f['sha256']==sha.hexdigest()),None)
+            if prior:
+                duplicates.append({'id':prior['id'],'name':pending[-1]['name']});path.unlink();pending.pop();remaining+=size
+        def update(s):
+            s['files'].extend(pending)
+            for duplicate in duplicates:
+                f=next(f for f in s['files'] if f['id']==duplicate['id'])
+                aliases=f.setdefault('aliases',[])
+                if duplicate['name']!=f['name'] and duplicate['name'] not in aliases:aliases.append(duplicate['name'])
+            if pending:s['pages_pending']=True;s['status']='uploaded'
         storage.mutate(pid,update)
         return public_state(storage.read(pid))
     except Exception:
@@ -128,6 +138,11 @@ def edit_spec(pid:str,data:SpecEdit):
     with storage.LOCK:
         idle(pid)
         if storage.read(pid)['revision']!=data.revision:raise HTTPException(409,'This project changed. Reload before saving.')
+        old=ModelSpec.model_validate(storage.read(pid)['spec'])
+        if old.footprint!=data.spec.footprint:
+            for o in data.spec.openings:o.reviewed=False
+            for b in data.spec.balconies:
+                if b.status=='reviewed':b.status='proposed'
         pipeline.save_spec(pid,data.spec,'Model specification updated locally')
     return public_state(storage.read(pid))
 

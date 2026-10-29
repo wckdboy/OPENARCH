@@ -11,8 +11,10 @@ def cell(value):
 
 def deliverables(run:Path,spec:ModelSpec,revision:int):
     q=quality(spec);meta=json.loads((run/'geometry-validation.json').read_text());rows=json.loads((run/'balconies.json').read_text())
+    from .footprint import facade_map
+    facades=facade_map(spec)
     with (run/'balcony-register.csv').open('w',newline='',encoding='utf-8-sig') as f:
-        fields=['id','level_id','apartment','center_x_mm','width_mm','depth_mm','guard_height_mm','type_id','status','elevation_mm']
+        fields=['id','facade_id','level_id','apartment','center_x_mm','width_mm','depth_mm','guard_height_mm','type_id','status','elevation_mm']
         writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
         for row in rows:writer.writerow({k:cell(row.get(k,'')) for k in fields})
     c=canvas.Canvas(str(run/'drawings.pdf'));c.setTitle('OPENARCH - model drawings')
@@ -45,14 +47,15 @@ def deliverables(run:Path,spec:ModelSpec,revision:int):
     text(15,269,f'{label} / Revision {revision} / Not construction documentation',9)
     view('front',15,55,170,190);view('plan',215,173,185,72);view('section',215,55,185,86)
     text(15,17,f"Envelope: {spec.width.value_mm:g} x {spec.depth.value_mm:g} mm. Eaves: {spec.eaves.value_mm:g} mm.")
-    text(15,10,'One rectangular building and one facade. Roof/trim profiles are simplified. See the evidence report for assumptions.',8)
+    text(15,10,'Polygon footprint / flat roof placeholder. Dimensions and boundary need review.' if spec.footprint else 'Rectangular building / simplified roof and trim profiles. See evidence report.',8)
     c.showPage();c.setPageSize((297*mm,210*mm));text(15,193,'BALCONY REGISTER / EVIDENCE',16);y=180
     text(15,y,f'{len(rows)} active placements / {q["reviewed_measurements"]} of {q["measurement_count"]} measurements reviewed. This is not an accuracy score.',9);y-=13
-    for x,label in [(15,'BALCONY ID'),(100,'LEVEL'),(130,'WIDTH x DEPTH'),(195,'TYPE'),(250,'STATUS')]:text(x,y,label,8)
+    for x,label in [(15,'BALCONY / FACADE'),(100,'LEVEL'),(130,'WIDTH x DEPTH'),(195,'TYPE'),(250,'STATUS')]:text(x,y,label,8)
     y-=9
     for row in rows:
         if y<25:c.showPage();c.setPageSize((297*mm,210*mm));y=190
-        text(15,y,str(row['id'])[:38],8);text(100,y,str(row['level_id'])[:15],8);text(130,y,f"{row['width_mm']:g} x {row['depth_mm']:g} mm",8);text(195,y,row['type_id'],8);text(250,y,row['status'],8);y-=7
+        text(15,y,str(row['id'])[:38],8);text(100,y,str(row['level_id'])[:15],8);text(130,y,f"{row['width_mm']:g} x {row['depth_mm']:g} mm",8);text(195,y,row['type_id'],8);text(250,y,row['status'],8)
+        text(15,y-4,facades.get(row.get('facade_id','front'),{}).get('label','Unknown facade'),7);y-=11
     y-=8
     pending=[x for x in q['review'] if not x.startswith(('opening:','balcony:'))]
     notes=spec.notes+q['missing']+q['conflicts']+['Measurements to review: '+', '.join(pending),f"Openings to review: {sum(x.startswith('opening:') for x in q['review'])}. Balconies to review: {sum(x.startswith('balcony:') for x in q['review'])}.", 'Full field-level evidence and review flags are included in evidence-report.json.']
@@ -61,7 +64,7 @@ def deliverables(run:Path,spec:ModelSpec,revision:int):
             if y<20:c.showPage();c.setPageSize((297*mm,210*mm));y=190
             text(15,y,wrapped,8);y-=5
     c.save()
-    report={'revision':revision,'quality':q,'spec':spec.model_dump(),'limitations':['Rectangular massing and front facade only','Parametric balconies; simplified profiles and connections','Evidence completeness does not measure geometric accuracy','FreeCAD edits are not imported back into the app; edit the spec in the review screen']}
+    report={'revision':revision,'quality':q,'spec':spec.model_dump(),'limitations':['Polygon roof is a flat placeholder; per-wing heights and pitched roof topology are not inferred' if spec.footprint else 'Rectangular massing and front facade only','Parametric balconies; simplified profiles and connections','Evidence completeness does not measure geometric accuracy','FreeCAD edits are not imported back into the app; edit the spec in the review screen']}
     (run/'evidence-report.json').write_text(json.dumps(report,indent=2))
     # Only generated outputs go in this download; original sources stay private.
     allowed={'building.FCStd','building.ifc','building.glb','presentation.blend','preview.png','front.svg','plan.svg','section.svg','drawings.pdf','balconies.json','balcony-register.csv','evidence-report.json','geometry-validation.json','ifc-validation.json','spec.json'}

@@ -15,6 +15,34 @@ class Level(Strict):
     id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,40}$")
     elevation: Measure
 
+class Corner(Strict):
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,20}$")
+    x: float = Field(ge=-200000, le=200000)
+    y: float = Field(ge=-200000, le=200000)
+
+class Ring(Strict):
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,20}$")
+    points: list[Corner] = Field(min_length=3, max_length=100)
+
+class Footprint(Strict):
+    outer: Ring
+    courtyards: list[Ring] = Field(default_factory=list, max_length=8)
+    coordinate_system: Literal['image','cartesian'] = 'image'
+    mm_per_unit: Measure = Field(default_factory=Measure)
+    source_page: str | None = None
+    confidence: float = Field(default=0, ge=0, le=1)
+    reviewed: bool = False
+
+    @model_validator(mode='after')
+    def valid_geometry(self):
+        from .footprint import geometry
+        rings=[self.outer,*self.courtyards]
+        if len({r.id for r in rings})!=len(rings):raise ValueError('Footprint ring IDs must be unique')
+        for r in rings:
+            if len({p.id for p in r.points})!=len(r.points):raise ValueError('Corner IDs must be unique within a ring')
+        geometry(self)
+        return self
+
 class Opening(Strict):
     id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,40}$")
     x_mm: float = Field(ge=0, le=200000)
@@ -25,6 +53,7 @@ class Opening(Strict):
     source_page: str | None = None
     confidence: float = Field(default=0, ge=0, le=1)
     reviewed: bool = False
+    facade_id: str = Field(default='front', max_length=80)
 
 class Balcony(Strict):
     id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
@@ -37,8 +66,10 @@ class Balcony(Strict):
     apartment: str = Field(default="", max_length=100)
     status: Literal["proposed", "reviewed", "excluded"] = "proposed"
     source_opening: str | None = None
+    facade_id: str = Field(default='front', max_length=80)
 
 class ModelSpec(Strict):
+    footprint: Footprint | None = None
     width: Measure = Field(default_factory=Measure)
     depth: Measure = Field(default_factory=Measure)
     eaves: Measure = Field(default_factory=Measure)
@@ -55,12 +86,25 @@ class ModelSpec(Strict):
             ids = [x.id for x in group]
             if len(ids) != len(set(ids)):
                 raise ValueError("Object IDs must be unique within each category")
+        if self.footprint:
+            from .footprint import geometry
+            g=geometry(self.footprint)
+            for name in ['width','depth']:
+                m=self.footprint.mm_per_unit.model_copy()
+                m.value_mm=g[name+'_mm'] if g else None
+                m.source_page=self.footprint.source_page
+                m.reviewed=bool(self.footprint.reviewed and m.reviewed)
+                setattr(self,name,m)
         return self
 
 def quality(spec: ModelSpec) -> dict:
     """Evidence completeness, never a claimed geometric accuracy percentage."""
     missing, review, conflicts = [], [], []
+    from .footprint import facade_map, balcony_polygon, convex_overlap, geometry, overlaps_building
+    facades=facade_map(spec)
+    footprint_geometry=geometry(spec.footprint) if spec.footprint else None
     measures = {n: getattr(spec, n) for n in ["width", "depth", "eaves", "roof_rise", "wall_thickness"]}
+    if spec.footprint:measures.pop('roof_rise')
     measures.update({"level:" + x.id: x.elevation for x in spec.levels})
     for key, m in measures.items():
         if m.value_mm is None:
@@ -69,6 +113,12 @@ def quality(spec: ModelSpec) -> dict:
             review.append(key)
     if not spec.levels:
         missing.append("levels")
+    if spec.footprint:
+        if spec.footprint.mm_per_unit.value_mm is None:missing.append('footprint scale')
+        if not spec.footprint.reviewed:review.append('footprint boundary')
+        if not spec.footprint.mm_per_unit.reviewed:review.append('footprint scale')
+        # Polygon roof topology is deliberately not invented from the perimeter.
+        review.append('polygon roof is a flat placeholder; pitched roof design is pending')
     for key in ["width", "depth", "eaves"]:
         m = getattr(spec, key)
         if m.value_mm is not None and m.value_mm < 1500:
@@ -87,20 +137,27 @@ def quality(spec: ModelSpec) -> dict:
     for o in spec.openings:
         if not o.reviewed:
             review.append("opening:" + o.id)
-        if w and h and (o.x_mm + o.width_mm > w or o.z_mm + o.height_mm > h):
+        f=facades.get(o.facade_id)
+        if not f:conflicts.append('Unknown opening facade: '+o.id)
+        if f and f['length_mm'] and (o.x_mm + o.width_mm > f['length_mm'] or (h and o.z_mm + o.height_mm > h)):
             conflicts.append("Opening outside facade: " + o.id)
     active = [b for b in spec.balconies if b.status != "excluded"]
     for b in active:
         if b.level_id not in levels or levels[b.level_id] is None:
             conflicts.append("Missing balcony level: " + b.id)
-        if w and (b.center_x_mm-b.width_mm/2 < 0 or b.center_x_mm+b.width_mm/2 > w):
+        f=facades.get(b.facade_id)
+        if not f:conflicts.append('Unknown balcony facade: '+b.id)
+        if f and f['length_mm'] and (b.center_x_mm-b.width_mm/2 < 0 or b.center_x_mm+b.width_mm/2 > f['length_mm']):
             conflicts.append("Balcony outside facade: " + b.id)
         if b.status != "reviewed":
             review.append("balcony:" + b.id)
+        if f and footprint_geometry and overlaps_building(balcony_polygon(b,f),footprint_geometry['rings']):
+            conflicts.append('Balcony intersects building footprint: '+b.id)
     for i,a in enumerate(active):
         for b in active[i+1:]:
             za,zb=levels.get(a.level_id),levels.get(b.level_id)
-            if za is not None and zb is not None and max(za-180,zb-180)<min(za+a.guard_height_mm,zb+b.guard_height_mm) and abs(a.center_x_mm-b.center_x_mm) < (a.width_mm+b.width_mm)/2:
+            fa,fb=facades.get(a.facade_id),facades.get(b.facade_id)
+            if fa and fb and za is not None and zb is not None and max(za-180,zb-180)<min(za+a.guard_height_mm,zb+b.guard_height_mm) and convex_overlap(balcony_polygon(a,fa),balcony_polygon(b,fb)):
                 conflicts.append("Overlapping balconies: " + a.id + ", " + b.id)
     checked = sum(m.reviewed and m.value_mm is not None for m in measures.values())
     return {"missing": missing, "review": review, "conflicts": conflicts,

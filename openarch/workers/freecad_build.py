@@ -1,6 +1,6 @@
 """Standalone worker for FreeCADCmd. Consumes validated JSON; never executes input code."""
 from pathlib import Path
-import os,json,time,uuid,re
+import os,json,time,uuid,re,math
 import FreeCAD as A,Part,TechDraw
 from PySide import QtCore
 
@@ -9,13 +9,16 @@ O=Path(job['output']);O.mkdir(exist_ok=True);s=job['spec'];V=A.Vector
 q=QtCore.QCoreApplication.instance() or QtCore.QCoreApplication([])
 d=A.newDocument('OPENARCH');visible=[]
 
-def box(name,l,w,h,x,y,z,material='wall',category='IfcBuildingElementProxy',bid='',show=True):
+def box(name,l,w,h,x,y,z,material='wall',category='IfcBuildingElementProxy',bid='',show=True,frame=None):
     o=d.addObject('Part::Box',name)
     for prop,value in [('Length',l),('Width',w),('Height',h),('Placement.Base.x',x),('Placement.Base.y',y),('Placement.Base.z',z)]:
         if isinstance(value,str):o.setExpression(prop,value)
         elif '.' not in prop:setattr(o,prop,value)
         else:
             p=o.Placement;setattr(p.Base,prop[-1],value);o.Placement=p
+    if frame:
+        tx,ty=frame['tangent'];ox,oy=frame['origin']
+        o.Placement=A.Placement(V(ox+tx*x-ty*y,oy+ty*x+tx*y,z),A.Rotation(V(0,0,1),frame['angle_deg']))
     tag(o,material,category,bid)
     o.Visibility=show
     if show:visible.append(o)
@@ -30,34 +33,58 @@ def feature(name,shape,mat,cls):
     o=d.addObject('Part::Feature',name);o.Shape=shape;tag(o,mat,cls);visible.append(o);return o
 
 W=s['width']['value_mm'];D=s['depth']['value_mm'];H=s['eaves']['value_mm'];T=s['wall_thickness']['value_mm'];R=s['roof_rise']['value_mm']
+footprint=job.get('footprint_geometry');frames=job.get('facades') or {'front':{'origin':[0,0],'tangent':[1,0],'angle_deg':0}}
+if footprint:R=0
 params=d.addObject('App::FeaturePython','BuildingDimensions')
 for k,value in [('Width',W),('Depth',D),('Eaves',H),('Wall',T),('RoofRise',R)]:params.addProperty('App::PropertyLength',k,'Dimensions');setattr(params,k,value)
-outer=box('Outer','BuildingDimensions.Width','BuildingDimensions.Depth','BuildingDimensions.Eaves',0,0,0,show=False)
-inner=box('Inner','BuildingDimensions.Width-2*BuildingDimensions.Wall','BuildingDimensions.Depth-2*BuildingDimensions.Wall','BuildingDimensions.Eaves+10 mm','BuildingDimensions.Wall','BuildingDimensions.Wall',-5,show=False)
-shell=d.addObject('Part::Cut','WallShell');shell.Base=outer;shell.Tool=inner;outer.Visibility=False;inner.Visibility=False
+if footprint:
+    def ring_face(points):
+        verts=[V(x,y,0) for x,y in points];return Part.Face(Part.makePolygon(verts+[verts[0]]))
+    footprint_face=ring_face(footprint['rings'][0])
+    for ring in footprint['rings'][1:]:footprint_face=footprint_face.cut(ring_face(ring))
+    volume=footprint_face.extrude(V(0,0,H));strips=[]
+    for frame in frames.values():
+        ox,oy=frame['origin'];tx,ty=frame['tangent'];length=frame['length_mm']
+        points=[(ox+tx*x-ty*y,oy+ty*x+tx*y) for x,y in [(-T,0),(length+T,0),(length+T,T),(-T,T)]]
+        strips.append(ring_face(points).extrude(V(0,0,H)))
+    shape=strips[0].multiFuse(strips[1:]).common(volume).removeSplitter()
+    interior_slab=footprint_face.extrude(V(0,0,180)).cut(shape).removeSplitter()
+    shell=d.addObject('Part::Feature','PolygonWallShell');shell.Shape=shape
+else:
+    outer=box('Outer','BuildingDimensions.Width','BuildingDimensions.Depth','BuildingDimensions.Eaves',0,0,0,show=False)
+    inner=box('Inner','BuildingDimensions.Width-2*BuildingDimensions.Wall','BuildingDimensions.Depth-2*BuildingDimensions.Wall','BuildingDimensions.Eaves+10 mm','BuildingDimensions.Wall','BuildingDimensions.Wall',-5,show=False)
+    shell=d.addObject('Part::Cut','WallShell');shell.Base=outer;shell.Tool=inner;outer.Visibility=False;inner.Visibility=False
 for i,o in enumerate(s['openings']):
-    cut=box('OpeningTool'+str(i),o['width_mm'],T+20,o['height_mm'],o['x_mm'],-10,o['z_mm'],show=False)
+    frame=frames[o.get('facade_id','front')]
+    cut=box('OpeningTool'+str(i),o['width_mm'],T+20,o['height_mm'],o['x_mm'],-10,o['z_mm'],show=False,frame=frame)
     result=d.addObject('Part::Cut','WallCut'+str(i));result.Base=shell;result.Tool=cut;shell.Visibility=False;cut.Visibility=False;shell=result
     # Inset glazing and simple opening trims are presentation details, not joinery.
     x,z,w,h=o['x_mm'],o['z_mm'],o['width_mm'],o['height_mm']
-    box('Glass'+str(i),w-80,12,h-80,x+40,T*.55,z+40,'glass')
-    for j,xx in enumerate([x,x+w-40]):box(f'Jamb{i}_{j}',40,70,h,xx,T*.5,z,'trim')
-    box('Head'+str(i),w-80,70,40,x+40,T*.5,z+h-40,'trim')
-    box('Sill'+str(i),w-80,70,40,x+40,T*.5,z,'trim')
-    box('Mullion'+str(i),35,70,h-80,x+w/2-17.5,T*.5,z+40,'trim')
-    box('Lintel'+str(i),w+160,65,90,x-80,-65,z+h,'trim')
+    box('Glass'+str(i),w-80,12,h-80,x+40,T*.55,z+40,'glass',frame=frame)
+    for j,xx in enumerate([x,x+w-40]):box(f'Jamb{i}_{j}',40,70,h,xx,T*.5,z,'trim',frame=frame)
+    box('Head'+str(i),w-80,70,40,x+40,T*.5,z+h-40,'trim',frame=frame)
+    box('Sill'+str(i),w-80,70,40,x+40,T*.5,z,'trim',frame=frame)
+    box('Mullion'+str(i),35,70,h-80,x+w/2-17.5,T*.5,z+40,'trim',frame=frame)
+    box('Lintel'+str(i),w+160,65,90,x-80,-65,z+h,'trim',frame=frame)
 tag(shell,'wall','IfcWall');shell.Visibility=True;visible.append(shell)
 levels={l['id']:l['elevation']['value_mm'] for l in s['levels']}
-for i,z in enumerate(levels.values()):box('Floor'+str(i),W-2*T,D-2*T,180,T,T,z-180,'floor','IfcSlab')
-if R>0:
+for i,z in enumerate(levels.values()):
+    if footprint:
+        slab=interior_slab.copy();slab.translate(V(0,0,z-180));feature('Floor'+str(i),slab,'floor','IfcSlab')
+    else:box('Floor'+str(i),W-2*T,D-2*T,180,T,T,z-180,'floor','IfcSlab')
+if footprint:
+    roof=footprint_face.extrude(V(0,0,180));roof.translate(V(0,0,H));feature('RoofPlaceholder',roof,'roof','IfcRoof')
+elif R>0:
     poly=Part.makePolygon([V(-150,-200,H),V(-150,D/2,H+R),V(-150,D+200,H),V(-150,-200,H)])
     feature('Roof',Part.Face(poly).extrude(V(W+300,0,0)),'roof','IfcRoof')
 else:box('Roof',W+200,D+200,180,-100,-100,H,'roof','IfcRoof')
-box('Cornice',W+160,160,130,-80,-160,H-130,'trim')
+if not footprint:box('Cornice',W+160,160,130,-80,-160,H-130,'trim')
 registry=[]
 for i,b in enumerate(s['balconies']):
     if b['status']=='excluded':continue
     group=d.addObject('App::Part',f'Balcony{i}');group.Label=b['id']
+    frame=frames[b.get('facade_id','front')]
+    group.Placement=A.Placement(V(*frame['origin'],0),A.Rotation(V(0,0,1),frame['angle_deg']))
     p=d.addObject('App::FeaturePython',f'B{i}Dimensions');group.addObject(p);p.Label='EDIT '+b['id']
     for k,value in [('Width',b['width_mm']),('Depth',b['depth_mm']),('Guard',b['guard_height_mm']),('CenterX',b['center_x_mm']),('Level',levels[b['level_id']])]:p.addProperty('App::PropertyLength',k,'Dimensions');setattr(p,k,value)
     p.addProperty('App::PropertyString','BalconyID','Identity');p.BalconyID=b['id'];ref=p.Name+'.'
@@ -93,7 +120,11 @@ for o in visible:
 
 # Cut away geometry above the plan's cut plane and below the selected storey.
 plan_z=min([z for z in levels.values() if z>0],default=0)
-compound=Part.makeCompound([o.Shape for o in visible])
+world_shapes=[]
+for o in visible:
+    shape=o.Shape.copy();shape.Placement=o.getGlobalPlacement();world_shapes.append(shape)
+compound=Part.makeCompound(world_shapes)
+world_source=d.addObject('Part::Feature','WorldDrawingGeometry');world_source.Shape=compound;world_source.Visibility=False
 plan_shape=compound.common(Part.makeBox(W+20000,D+20000,1500,V(-10000,-10000,plan_z-250)))
 plan_source=d.addObject('Part::Feature','PlanCutGeometry');plan_source.Shape=plan_shape;plan_source.Visibility=False
 template=O/'sheet-template.svg';template.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="420mm" height="297mm" viewBox="0 0 420 297"><text x="12" y="15" font-size="5">OPENARCH / DRAFT</text></svg>')
@@ -101,10 +132,10 @@ page=d.addObject('TechDraw::DrawPage','Drawings');tpl=d.addObject('TechDraw::Dra
 scale=min(.01,180/(H+R),175/W)
 def view(name,source,direction,x,y):
     v=d.addObject('TechDraw::DrawViewPart',name);page.addView(v);v.Source=source;v.Direction=direction;v.CoarseView=True;v.ScaleType='Custom';v.Scale=scale;v.X=x;v.Y=y;return v
-front=view('Front',visible,(0,-1,0),110,160)
+front=view('Front',[world_source],(0,-1,0),110,160)
 front.XDirection=(-1,0,0)
 plan=view('Plan',[plan_source],(0,0,1),300,210)
-section=d.addObject('TechDraw::DrawViewSection','Section');page.addView(section);section.BaseView=front;section.XDirection=(0,-1,0);section.Direction=(1,0,0);section.Source=visible;section.SectionNormal=(1,0,0);section.SectionOrigin=(W/2,D/2,H/2);section.ScaleType='Custom';section.Scale=scale;section.CoarseView=True;section.X=300;section.Y=90
+section=d.addObject('TechDraw::DrawViewSection','Section');page.addView(section);section.BaseView=front;section.XDirection=(0,-1,0);section.Direction=(1,0,0);section.Source=[world_source];section.SectionNormal=(1,0,0);section.SectionOrigin=(W/2,D/2,H/2);section.ScaleType='Custom';section.Scale=scale;section.CoarseView=True;section.X=300;section.Y=90
 d.recompute()
 deadline=time.monotonic()+12
 while time.monotonic()<deadline:q.processEvents();time.sleep(.025)
@@ -117,7 +148,7 @@ for v in [front,plan,section]:
     (O/(v.Name.lower()+'.svg')).write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{bounds[2]-bounds[0]+4}mm" height="{bounds[3]-bounds[1]+4}mm" viewBox="{bounds[0]-2} {-bounds[3]-2} {bounds[2]-bounds[0]+4} {bounds[3]-bounds[1]+4}"><g transform="scale(1,-1)">{raw}</g></svg>')
     views[v.Name.lower()]={'bounds':bounds,'scale':scale,'visible_edges':len(v.getVisibleEdges())}
 d.saveAs(str(O/'building.FCStd'));A.closeDocument(d.Name)
-(O/'geometry-validation.json').write_text(json.dumps({'valid_solids':True,'object_count':len(visible),'balcony_count':len(registry),'views':views,'plan_cut_elevation_mm':plan_z+1250,'model_z_center_mm':(compound.BoundBox.ZMin+compound.BoundBox.ZMax)/2},indent=2))
+(O/'geometry-validation.json').write_text(json.dumps({'valid_solids':True,'object_count':len(visible),'balcony_count':len(registry),'views':views,'plan_cut_elevation_mm':plan_z+1250,'model_z_center_mm':(compound.BoundBox.ZMin+compound.BoundBox.ZMax)/2,'footprint_area_mm2':footprint_face.Area if footprint else W*D,'courtyard_count':len(footprint['rings'])-1 if footprint else 0,'roof_placeholder':bool(footprint)},indent=2))
 
 # IFC4 exchange, generated from the exact meshes used for the render.
 import ifcopenshell,ifcopenshell.api,ifcopenshell.validate
@@ -134,7 +165,7 @@ for key,z in levels.items():
 assemblies={}
 for b in registry:
     e=root('IfcElementAssembly',b['id'],'balcony/'+b['id']);e.PredefinedType='USERDEFINED';e.ObjectType='Balcony';api('spatial.assign_container',f,products=[e],relating_structure=stores[b['level_id']])
-    p=api('pset.add_pset',f,product=e,name='OPENARCH');api('pset.edit_pset',f,pset=p,properties={'BalconyID':b['id'],'Width_mm':b['width_mm'],'Depth_mm':b['depth_mm'],'Apartment':b['apartment'],'Status':b['status']});assemblies[b['id']]=e
+    p=api('pset.add_pset',f,product=e,name='OPENARCH');api('pset.edit_pset',f,pset=p,properties={'BalconyID':b['id'],'FacadeID':b.get('facade_id','front'),'Width_mm':b['width_mm'],'Depth_mm':b['depth_mm'],'Apartment':b['apartment'],'Status':b['status']});assemblies[b['id']]=e
 for m in mesh:
     e=root(m['ifc_class'],m['name'],'part/'+m['name'])
     rep=api('geometry.add_mesh_representation',f,context=body,vertices=[[[x/1000 for x in v] for v in m['vertices_mm']]],faces=[m['faces']]);api('geometry.assign_representation',f,product=e,representation=rep);api('geometry.edit_object_placement',f,product=e)

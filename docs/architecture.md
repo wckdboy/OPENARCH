@@ -17,7 +17,7 @@ flowchart LR
   I --> J
 ```
 
-FastAPI serves a dependency-free browser interface on loopback. A single local worker serializes PDFium and CAD workloads. Project state is stored atomically as JSON. Startup marks interrupted jobs for retry. There is no hidden external queue, data sync or background upload.
+FastAPI serves a dependency-free browser interface on loopback. A single local worker serializes ingestion and CAD workloads. PDF decoding runs in a child process; optional Poppler rendering uses a bounded subprocess per page. Project state is stored atomically as JSON. Startup marks interrupted jobs for retry. There is no hidden external queue, data sync or background upload.
 
 ## Source evidence and identity
 
@@ -29,17 +29,17 @@ Balconies have stable IDs, a level, facade position, width, depth, guard height,
 
 ## Current modelling envelope
 
-The current worker creates a rectangular hollow wall shell, front openings, floor slabs, a simple roof, trim and two generic balcony guard variants. Balcony lengths and positions use native FreeCAD expressions. Plan and section cuts come from the same solids used for the render and IFC.
+The rectangular worker creates a hollow wall shell, front openings, floor slabs, a simple roof and trim. The polygon worker accepts a simple outer ring plus disjoint courtyard holes, clips wall strips and slabs to the building area, and uses a flat roof placeholder. Both paths support two generic balcony guard variants. Polygon objects use facade frames derived from persistent corner IDs; balconies can face the street or a courtyard. Boundary and scale are stored separately so an unscaled sketch is never presented as metric geometry. Balcony lengths and positions use native FreeCAD expressions. Plan and section cuts come from the same solids used for the render and IFC.
 
 The specification, not a generated FCStd or Blender file, is the source of truth. Native documents remain useful for inspection and further manual editing, but importing native edits back into the specification is not implemented.
 
 ## What must improve for real-project automation
 
 1. **Document understanding:** drawing-region segmentation, rotation/deskew, dimension-chain parsing, Danish OCR benchmarking, revision conflict handling and evidence bounding boxes. Current local parsing is intentionally narrow.
-2. **Geometry:** polygon footprints and courtyard voids, multiple facades, roof variants, dormers, party walls and per-storey changes. Keep the initial rectangular path as a tested subset.
+2. **Geometry:** extend the implemented polygon/courtyard and facade-frame support with per-wing heights, pitched roof topology, dormers, party walls and per-storey changes. Keep the initial rectangular path as a tested subset.
 3. **Calibration:** separate scale/transform per drawing region, perspective correction from multiple anchors, discrepancy reporting across views and measured site dimensions.
 4. **Balcony library:** configurable polygon decks and guard families, detailed editable profiles and access-opening associations. No proprietary family conversion is assumed.
-5. **Placement review:** facade overlay editing, stack propagation, stable apartment mapping, clearance rules and review of proposed window-to-door changes.
+5. **Placement review:** extend the implemented facade overlays and tables with stack propagation, stable apartment mapping, clearance rules and review of proposed window-to-door changes.
 6. **Production operation:** transactional storage/job queue, project backups, access control, team audit trail, retention controls, packaged installers and application-level migrations.
 
 ## Measure the 90-95% target
